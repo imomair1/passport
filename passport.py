@@ -10,7 +10,7 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 
 # Set page configuration
 st.set_page_config(
-    page_title="Passport Photo Generator",
+    page_title="Passport Photo Generator by Umair",
     page_icon="📷",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -264,7 +264,7 @@ def main():
         st.session_state.face_feedback = ""
     
     # Main content area
-    st.title("📷 Passport Photo Generator")
+    st.title("📷 Passport Photo Generator by  Umair")
     st.write("Create professional passport photos that meet official requirements for various countries.")
     
     # Create two columns for the main interface
