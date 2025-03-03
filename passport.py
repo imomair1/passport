@@ -6,7 +6,6 @@ import cv2
 from rembg import remove
 import requests
 import base64
-from streamlit_image_coordinates import ImageCoordinatesCallback
 
 # Set page configuration
 st.set_page_config(
@@ -207,19 +206,19 @@ def apply_face_detection(image):
     
     return Image.fromarray(img_with_rect), message
 
-def crop_image(image, crop_coords):
-    """Crop the image based on user-selected coordinates"""
-    if not crop_coords or len(crop_coords) < 2:
-        return image
+def crop_image_center(image, crop_percentage=0.8):
+    """Crop the center portion of the image based on percentage"""
+    width, height = image.size
     
-    x1, y1 = crop_coords[0]
-    x2, y2 = crop_coords[1]
+    # Calculate new dimensions
+    new_width = int(width * crop_percentage)
+    new_height = int(height * crop_percentage)
     
-    # Ensure correct ordering of coordinates
-    left = min(x1, x2)
-    upper = min(y1, y2)
-    right = max(x1, x2)
-    lower = max(y1, y2)
+    # Calculate left, upper, right, lower coordinates for cropping
+    left = (width - new_width) // 2
+    upper = (height - new_height) // 2
+    right = left + new_width
+    lower = upper + new_height
     
     # Crop the image
     cropped_img = image.crop((left, upper, right, lower))
@@ -228,7 +227,6 @@ def crop_image(image, crop_coords):
 def main():
     # Add a sidebar for app navigation
     with st.sidebar:
-        st.image("https://i.imgur.com/iMmyeKr.png", width=80)  # Placeholder icon
         st.title("Passport Photo Generator")
         st.markdown("Create professional passport photos that meet official requirements.")
         
@@ -258,8 +256,6 @@ def main():
         st.session_state.processed = False
     if 'enhanced_image' not in st.session_state:
         st.session_state.enhanced_image = None
-    if 'crop_coords' not in st.session_state:
-        st.session_state.crop_coords = []
     if 'face_feedback' not in st.session_state:
         st.session_state.face_feedback = ""
     
@@ -271,7 +267,7 @@ def main():
     col1, col2 = st.columns([1, 1])
     
     with col1:
-        # File upload area with drag and drop
+        # File upload area
         uploaded_file = st.file_uploader(
             "Upload your photo", 
             type=["jpg", "jpeg", "png"],
@@ -287,25 +283,16 @@ def main():
                 if 'original_image' not in st.session_state:
                     st.session_state.original_image = original_image
                 
-                # Display image for cropping
+                # Display image
                 st.subheader("Original Image")
+                st.image(original_image, use_column_width=True)
                 
-                # Add crop functionality
-                if st.checkbox("Enable Manual Cropping", help="Select two points to crop your image"):
-                    with ImageCoordinatesCallback() as img_coords:
-                        st.image(original_image, use_column_width=True)
-                        
-                    if img_coords.coords:
-                        if len(img_coords.coords) <= 2:
-                            st.session_state.crop_coords = img_coords.coords
-                            if len(img_coords.coords) == 2:
-                                original_image = crop_image(original_image, st.session_state.crop_coords)
-                                st.success("Image cropped successfully!")
-                                # Clear coordinates after cropping
-                                st.session_state.crop_coords = []
-                        else:
-                            st.warning("Please select only two points for cropping")
-                else:
+                # Simple cropping options
+                if st.checkbox("Auto Crop Image", help="Automatically crop to center portion of the image"):
+                    crop_amount = st.slider("Crop Amount", 0.5, 1.0, 0.8, 0.05, 
+                                            help="Lower values crop more from the edges")
+                    original_image = crop_image_center(original_image, crop_amount)
+                    st.success("Image cropped!")
                     st.image(original_image, use_column_width=True)
                 
                 # Face detection button
@@ -394,14 +381,6 @@ def main():
                             border: 1px solid #ddd;
                             margin-bottom: 10px;"></div>
                 """, unsafe_allow_html=True)
-                
-                # Background removal quality
-                bg_quality = st.select_slider(
-                    "Background removal quality",
-                    options=["Fast", "Balanced", "High Quality"],
-                    value="Balanced",
-                    help="Higher quality takes longer but gives better results"
-                )
             
             with tabs[2]:
                 st.subheader("Enhancement Settings")
@@ -568,7 +547,7 @@ def main():
             # Format selection
             download_format = st.radio(
                 "Select format",
-                ["JPEG", "PNG", "PDF"],
+                ["JPEG", "PNG"],
                 horizontal=True
             )
             
@@ -585,31 +564,10 @@ def main():
                 st.session_state.final_image.save(buf, format="JPEG", quality=quality)
                 file_extension = "jpg"
                 mime_type = "image/jpeg"
-            elif download_format == "PNG":
+            else:  # PNG
                 st.session_state.final_image.save(buf, format="PNG")
                 file_extension = "png"
                 mime_type = "image/png"
-            else:  # PDF
-                from reportlab.pdfgen import canvas
-                from reportlab.lib.pagesizes import letter
-                
-                # Convert PIL to PDF
-                img_width, img_height = st.session_state.final_image.size
-                pdf_w, pdf_h = letter
-                
-                p = canvas.Canvas(buf, pagesize=letter)
-                # Center the image on the page
-                x_centered = (pdf_w - img_width) / 2
-                y_centered = (pdf_h - img_height) / 2
-                
-                # Draw image on the PDF
-                img_path = "temp_img.jpg"
-                st.session_state.final_image.save(img_path)
-                p.drawImage(img_path, x_centered, y_centered, width=img_width, height=img_height)
-                p.save()
-                
-                file_extension = "pdf"
-                mime_type = "application/pdf"
             
             st.download_button(
                 label=f"Download as {download_format}",
