@@ -1,0 +1,8 @@
+streamlit==1.30.0
+Pillow==10.1.0
+numpy==1.26.2
+opencv-python==4.8.1.78
+rembg==2.0.50
+streamlit-image-coordinates==0.1.6
+reportlab==3.6.13
+requests==2.31.0
