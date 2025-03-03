@@ -20,7 +20,7 @@ A Streamlit web application that allows users to create professional passport ph
 
 1. Clone this repository:
 ```
-git clone https://github.com/yourusername/passport-photo-generator.git
+git clone https://github.com/imomair1/passport-photo-generator.git
 cd passport-photo-generator
 ```
 
