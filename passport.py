@@ -6,7 +6,7 @@ import cv2
 from rembg import remove
 import requests
 import base64
-from streamlit_image_coordinates import ImageCoordinatesCallback
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 # Set page configuration
 st.set_page_config(
