@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.env
+*.secret
+
+# System
+.DS_Store
+
+# Virtual Environment
+venv/
+env/
+
+# Temporary files
+*.tmp
+*.temp
