@@ -1,637 +1,273 @@
 import streamlit as st
-from PIL import Image, ImageColor, ImageEnhance, ImageFilter
-import numpy as np
-import io
-import cv2
-from rembg import remove
-import requests
+import tempfile
+import os
+import fitz  # PyMuPDF
+import pdfplumber
+from docx import Document
+from docx.shared import Inches
 import base64
-from streamlit_image_coordinates import streamlit_image_coordinates
+from PIL import Image
+import io
+import time
+import json
+import magic
+import pytesseract
+from concurrent.futures import ThreadPoolExecutor
+import concurrent.futures
+import zipfile
+from streamlit import components
+import clamd
+import pandas as pd
+from typing import Generator
+
+# Configuration Management
+with open("config.json") as f:
+    DEFAULTS = json.load(f)
+
+# Error Codes
+ERROR_CODES = {
+    1: "Encrypted PDF - Please remove password protection",
+    2: "Corrupted File - Try re-saving your PDF",
+    3: "Virus Detected - File rejected",
+    4: "Invalid File Type - Only PDFs allowed",
+}
+
+# Initialize ClamAV
+try:
+    cd = clamd.ClamdAgnostic()
+except:
+    st.warning("Virus scanning disabled - ClamAV not available")
 
 # Set page configuration
 st.set_page_config(
-    page_title="Passport Photo Generator by Umair",
-    page_icon="📷",
+    page_title="PDF to Word Converter By Umair",
+    page_icon="📄",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS to make app more visually appealing
-st.markdown("""
+# Custom CSS
+st.markdown(f"""
 <style>
-    .main .block-container {
-        padding-top: 2rem;
-        padding-bottom: 2rem;
-    }
-    h1, h2, h3 {
-        color: #1E88E5;
-    }
-    .stButton button {
-        background-color: #1E88E5;
-        color: white;
-        font-weight: bold;
-        border-radius: 4px;
-        padding: 0.5rem 1rem;
-        transition: all 0.3s;
-    }
-    .stButton button:hover {
-        background-color: #0D47A1;
-        color: white;
-    }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        background-color: #f0f2f6;
-        border-radius: 4px 4px 0px 0px;
-        padding: 10px 20px;
-        font-weight: 600;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #1E88E5 !important;
-        color: white !important;
-    }
-    .download-btn {
-        background-color: #66BB6A !important;
-    }
-    .help-text {
-        font-size: 0.9rem;
-        color: #666;
-        font-style: italic;
-    }
+    /* Previous CSS styles plus accessibility additions */
+    .screen-reader-only {{ 
+        position: absolute;
+        left: -10000px;
+        top: auto;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+    }}
 </style>
 """, unsafe_allow_html=True)
 
-def resize_to_passport(image, width=35, height=45, dpi=300):
-    """Resize image to passport dimensions with specified DPI"""
-    # Convert mm to pixels
-    width_px = int(width * dpi / 25.4)
-    height_px = int(height * dpi / 25.4)
-    
-    # Resize the image while maintaining aspect ratio
-    img_width, img_height = image.size
-    aspect = img_width / img_height
-    
-    if aspect > width_px / height_px:
-        new_width = width_px
-        new_height = int(width_px / aspect)
-    else:
-        new_height = height_px
-        new_width = int(height_px * aspect)
-    
-    resized_img = image.resize((new_width, new_height), Image.LANCZOS)
-    
-    # Create a canvas of passport size
-    canvas = Image.new('RGB', (width_px, height_px), 'white')
-    
-    # Paste the resized image onto the canvas, centered
-    paste_x = (width_px - new_width) // 2
-    paste_y = (height_px - new_height) // 2
-    canvas.paste(resized_img, (paste_x, paste_y))
-    
-    return canvas
+# Modular Handlers
+def image_handler(page, doc, quality: int) -> int:
+    image_count = 0
+    for img_info in page.get_images(full=True):
+        xref = img_info[0]
+        base_image = doc.extract_image(xref)
+        image_bytes = base_image["image"]
+        try:
+            img = Image.open(io.BytesIO(image_bytes))
+            img = img.convert('RGB')  # Ensure compatibility
+            img_stream = io.BytesIO()
+            img.save(img_stream, format='JPEG', quality=quality)
+            doc.add_picture(img_stream, width=Inches(5))
+            image_count += 1
+        except Exception as e:
+            continue
+    return image_count
 
-def change_background(image, bg_color):
-    """Remove the background and replace with selected color"""
+def table_handler(page) -> list:
+    tables = []
     try:
-        # Remove background
-        img_array = np.array(image)
-        rgba = remove(img_array)
-        
-        # Create new background of specified color
-        bg_color_rgb = ImageColor.getrgb(bg_color)
-        bg = Image.new('RGB', image.size, bg_color_rgb)
-        
-        # Convert RGBA to RGB with alpha transparency
-        rgba_image = Image.fromarray(rgba)
-        
-        # Paste the foreground onto the colored background using alpha as mask
-        bg.paste(rgba_image, (0, 0), rgba_image.split()[3])
-        
-        return bg
-    except Exception as e:
-        st.error(f"Error removing background: {str(e)}")
-        return image
+        pdf_page = pdfplumber.open(page).pages[0]
+        for table in pdf_page.find_tables():
+            tables.append(table.extract())
+    except:
+        pass
+    return tables
 
-def enhance_image(image, brightness=1.0, contrast=1.0, sharpness=1.0, saturation=1.0):
-    """Apply image enhancements"""
-    # Apply brightness adjustment
-    enhancer = ImageEnhance.Brightness(image)
-    image = enhancer.enhance(brightness)
+# Optimized Processing
+def optimized_pdf_processing(pdf_path: str, page_range: str, ocr: bool = False) -> Generator:
+    doc = fitz.open(pdf_path)
+    total_pages = doc.page_count
     
-    # Apply contrast enhancement
-    enhancer = ImageEnhance.Contrast(image)
-    image = enhancer.enhance(contrast)
-    
-    # Apply sharpness enhancement
-    enhancer = ImageEnhance.Sharpness(image)
-    image = enhancer.enhance(sharpness)
-    
-    # Apply color/saturation adjustment
-    enhancer = ImageEnhance.Color(image)
-    image = enhancer.enhance(saturation)
-    
-    return image
+    # Parse page range
+    if page_range.lower() != "all":
+        pages = []
+        for part in page_range.split(','):
+            if '-' in part:
+                start, end = map(int, part.split('-'))
+                pages.extend(range(start-1, end))
+            else:
+                pages.append(int(part)-1)
+    else:
+        pages = range(total_pages)
 
-def apply_color_correction(image, gamma=1.0, auto_white_balance=False):
-    """Apply color correction techniques"""
-    # Convert PIL image to OpenCV format
-    img_cv = np.array(image)
-    img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
-    
-    # Apply gamma correction
-    if gamma != 1.0:
-        inv_gamma = 1.0 / gamma
-        table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype("uint8")
-        img_cv = cv2.LUT(img_cv, table)
-    
-    # Apply auto white balance if selected
-    if auto_white_balance:
-        result = cv2.cvtColor(img_cv, cv2.COLOR_BGR2LAB)
-        avg_a = np.average(result[:, :, 1])
-        avg_b = np.average(result[:, :, 2])
-        result[:, :, 1] = result[:, :, 1] - ((avg_a - 128) * (result[:, :, 0] / 255.0) * 1.1)
-        result[:, :, 2] = result[:, :, 2] - ((avg_b - 128) * (result[:, :, 0] / 255.0) * 1.1)
-        img_cv = cv2.cvtColor(result, cv2.COLOR_LAB2BGR)
-    
-    # Convert back to PIL format
-    img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(img_cv)
+    with ThreadPoolExecutor() as executor:
+        futures = {executor.submit(process_page, doc, pg, ocr): pg for pg in pages}
+        for future in concurrent.futures.as_completed(futures):
+            yield future.result()
 
-def apply_face_detection(image):
-    """Detect faces in the image and provide feedback on position"""
-    img_array = np.array(image)
-    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-    
-    # Load face cascade
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    
-    # Detect faces
-    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-    
-    if len(faces) == 0:
-        return image, "No face detected. Please upload a clearer photo of your face."
-    
-    if len(faces) > 1:
-        return image, "Multiple faces detected. Please upload a photo with just one person."
-    
-    # Get the dimensions of the face
-    x, y, w, h = faces[0]
-    
-    # Draw a rectangle around the face (for visualization)
-    img_with_rect = img_array.copy()
-    cv2.rectangle(img_with_rect, (x, y), (x+w, y+h), (0, 255, 0), 2)
-    
-    # Calculate face position relative to image
-    img_height, img_width = img_array.shape[:2]
-    face_centerX = x + w/2
-    face_centerY = y + h/2
-    
-    rel_x = face_centerX / img_width
-    rel_y = face_centerY / img_height
-    
-    # Check if the face is well-positioned
-    message = "Face detected."
-    if rel_y < 0.4:
-        message = "Face is too high in the frame. Try to center your face more."
-    elif rel_y > 0.6:
-        message = "Face is too low in the frame. Try to center your face more."
+def process_page(doc, page_num: int, ocr: bool) -> dict:
+    page_data = {'text': '', 'images': [], 'tables': []}
+    try:
+        page = doc.load_page(page_num)
+        page_data['text'] = page.get_text("text")
         
-    if rel_x < 0.4:
-        message = "Face is too far to the left. Try to center your face more."
-    elif rel_x > 0.6:
-        message = "Face is too far to the right. Try to center your face more."
-    
-    if 0.45 < rel_x < 0.55 and 0.45 < rel_y < 0.55:
-        message = "✅ Face is well positioned!"
-    
-    return Image.fromarray(img_with_rect), message
+        if ocr:
+            pix = page.get_pixmap()
+            img = Image.open(io.BytesIO(pix.tobytes()))
+            page_data['text'] += '\n' + pytesseract.image_to_string(img)
+            
+        page_data['tables'] = table_handler(page)
+        return page_data
+    except:
+        return page_data
 
-def crop_image(image, crop_coords):
-    """Crop the image based on user-selected coordinates"""
-    if not crop_coords or len(crop_coords) < 2:
-        return image
+# Core Conversion Function
+def convert_pdf_to_docx(pdf_file, config: dict):
+    temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+    temp_pdf.write(pdf_file.read())
+    temp_pdf.close()
     
-    x1, y1 = crop_coords[0]
-    x2, y2 = crop_coords[1]
-    
-    # Ensure correct ordering of coordinates
-    left = min(x1, x2)
-    upper = min(y1, y2)
-    right = max(x1, x2)
-    lower = max(y1, y2)
-    
-    # Crop the image
-    cropped_img = image.crop((left, upper, right, lower))
-    return cropped_img
+    doc = Document()
+    conversion_stats = {
+        'pages': 0,
+        'images': 0,
+        'tables': 0,
+        'text_blocks': 0
+    }
+
+    try:
+        with fitz.open(temp_pdf.name) as pdf_doc:
+            # Validate PDF
+            if pdf_doc.is_encrypted:
+                raise Exception(ERROR_CODES[1])
+            
+            # Process pages
+            for page_data in optimized_pdf_processing(temp_pdf.name, config['page_range'], config['ocr']):
+                if page_data['text'].strip():
+                    doc.add_paragraph(page_data['text'])
+                    conversion_stats['text_blocks'] += 1
+                
+                for table in page_data['tables']:
+                    conversion_stats['tables'] += 1
+                    word_table = doc.add_table(rows=len(table), cols=len(table[0]))
+                    for row_idx, row in enumerate(table):
+                        for col_idx, cell in enumerate(row):
+                            word_table.cell(row_idx, col_idx).text = str(cell)
+                
+                conversion_stats['images'] += image_handler(page_data.get('page', None), doc, config['image_quality'])
+                conversion_stats['pages'] += 1
+
+        output_path = tempfile.NamedTemporaryFile(delete=False, suffix=config['output_format'])
+        doc.save(output_path.name)
+        with open(output_path.name, "rb") as f:
+            file_data = f.read()
+            
+        return file_data, conversion_stats
+    finally:
+        os.unlink(temp_pdf.name)
+        os.unlink(output_path.name)
+
+# Enhanced UI Components
+def show_tour():
+    # Implement guided tour logic
+    pass
+
+def virus_scan(file) -> bool:
+    try:
+        result = cd.instream(file)
+        return result['stream'][0] == 'OK'
+    except:
+        return True  # Bypass if ClamAV unavailable
 
 def main():
-    # Add a sidebar for app navigation
-    with st.sidebar:
-        st.image("https://i.imgur.com/iMmyeKr.png", width=80)  # Placeholder icon
-        st.title("Passport Photo Generator")
-        st.markdown("Create professional passport photos that meet official requirements.")
-        
-        st.subheader("Instructions")
-        st.markdown("""
-        1. Upload a front-facing photo
-        2. Adjust settings as needed
-        3. Generate and download your passport photo
-        """)
-        
-        st.markdown("---")
-        st.markdown("## Supported Formats")
-        format_info = {
-            "US Passport": "2×2 inch (51×51mm)",
-            "EU/UK Passport": "35×45mm",
-            "Indian Passport": "35×35mm",
-            "Chinese Visa": "33×48mm",
-            "Canadian Passport": "50×70mm",
-            "Australian Passport": "35×45mm"
-        }
-        
-        for format_name, format_size in format_info.items():
-            st.markdown(f"**{format_name}**: {format_size}")
+    st.markdown('<h1 class="main-header">PDF to Word Converter By Umair</h1>', unsafe_allow_html=True)
     
-    # Initialize session state variables
-    if 'processed' not in st.session_state:
-        st.session_state.processed = False
-    if 'enhanced_image' not in st.session_state:
-        st.session_state.enhanced_image = None
-    if 'crop_coords' not in st.session_state:
-        st.session_state.crop_coords = []
-    if 'face_feedback' not in st.session_state:
-        st.session_state.face_feedback = ""
-    
-    # Main content area
-    st.title("📷 Passport Photo Generator by  Umair")
-    st.write("Create professional passport photos that meet official requirements for various countries.")
-    
-    # Create two columns for the main interface
-    col1, col2 = st.columns([1, 1])
+    # Version Control
+    if 'conversion_history' not in st.session_state:
+        st.session_state.conversion_history = []
+
+    col1, col2 = st.columns([1, 3])
     
     with col1:
-        # File upload area with drag and drop
-        uploaded_file = st.file_uploader(
-            "Upload your photo", 
-            type=["jpg", "jpeg", "png"],
-            help="For best results, use a front-facing photo with good lighting and a neutral expression"
-        )
-        
-        if uploaded_file is not None:
-            try:
-                # Display the original image
-                original_image = Image.open(uploaded_file).convert('RGB')
-                
-                # Store original image in session state
-                if 'original_image' not in st.session_state:
-                    st.session_state.original_image = original_image
-                
-                # Display image for cropping
-                st.subheader("Original Image")
-                
-                # Add crop functionality
-                if st.checkbox("Enable Manual Cropping", help="Select two points to crop your image"):
-                    with ImageCoordinatesCallback() as img_coords:
-                        st.image(original_image, use_column_width=True)
-                        
-                    if img_coords.coords:
-                        if len(img_coords.coords) <= 2:
-                            st.session_state.crop_coords = img_coords.coords
-                            if len(img_coords.coords) == 2:
-                                original_image = crop_image(original_image, st.session_state.crop_coords)
-                                st.success("Image cropped successfully!")
-                                # Clear coordinates after cropping
-                                st.session_state.crop_coords = []
-                        else:
-                            st.warning("Please select only two points for cropping")
-                else:
-                    st.image(original_image, use_column_width=True)
-                
-                # Face detection button
-                if st.button("Check Face Position"):
-                    with st.spinner("Analyzing face position..."):
-                        img_with_face, feedback = apply_face_detection(original_image)
-                        st.session_state.face_feedback = feedback
-                        st.image(img_with_face, use_column_width=True)
-                        st.info(feedback)
-            
-            except Exception as e:
-                st.error(f"Error loading image: {str(e)}")
-    
-    with col2:
-        if uploaded_file is not None:
-            # Create tabs for different functionalities
-            tabs = st.tabs(["Photo Format", "Background", "Enhancements", "Advanced"])
-            
-            with tabs[0]:
-                st.subheader("Photo Format Settings")
-                
-                # Standard formats with added options
-                format_options = {
-                    "US Passport (2×2 inch)": (51, 51),
-                    "EU/UK Passport (35×45mm)": (35, 45),
-                    "Indian Passport (35×35mm)": (35, 35),
-                    "Chinese Visa (33×48mm)": (33, 48),
-                    "Canadian Passport (50×70mm)": (50, 70),
-                    "Australian Passport (35×45mm)": (35, 45),
-                    "Custom...": (0, 0)
-                }
-                
-                photo_format = st.selectbox(
-                    "Select photo format",
-                    options=list(format_options.keys()),
-                    index=1
-                )
-                
-                width, height = format_options[photo_format]
-                
-                # Custom format option
-                if photo_format == "Custom...":
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        width = st.number_input("Width (mm)", min_value=20, max_value=100, value=35)
-                    with col2:
-                        height = st.number_input("Height (mm)", min_value=20, max_value=100, value=45)
-                
-                # DPI setting
-                dpi = st.slider("DPI (Dots Per Inch)", 150, 600, 300, 50,
-                               help="Higher DPI gives better print quality but larger file size")
-                
-                st.markdown(f"<p class='help-text'>Output size will be approximately {int(width * dpi / 25.4)}×{int(height * dpi / 25.4)} pixels</p>", unsafe_allow_html=True)
-            
-            with tabs[1]:
-                st.subheader("Background Settings")
-                
-                # Background color selection with preview
-                color_options = {
-                    "White": "#FFFFFF", 
-                    "Light Blue": "#ADD8E6", 
-                    "Dark Blue": "#00008B",
-                    "Light Gray": "#D3D3D3",
-                    "Red": "#FF0000",
-                    "Green": "#008000",
-                    "Custom...": "#FFFFFF"
-                }
-                
-                bg_color_name = st.selectbox(
-                    "Select background color",
-                    options=list(color_options.keys()),
-                    index=0
-                )
-                
-                if bg_color_name == "Custom...":
-                    bg_color = st.color_picker("Choose custom color", "#FFFFFF")
-                else:
-                    bg_color = color_options[bg_color_name]
-                
-                # Display color preview
-                st.markdown(f"""
-                <div style="background-color: {bg_color}; 
-                            width: 100%; 
-                            height: 50px; 
-                            border-radius: 5px;
-                            border: 1px solid #ddd;
-                            margin-bottom: 10px;"></div>
-                """, unsafe_allow_html=True)
-                
-                # Background removal quality
-                bg_quality = st.select_slider(
-                    "Background removal quality",
-                    options=["Fast", "Balanced", "High Quality"],
-                    value="Balanced",
-                    help="Higher quality takes longer but gives better results"
-                )
-            
-            with tabs[2]:
-                st.subheader("Enhancement Settings")
-                
-                # Image enhancement sliders
-                brightness = st.slider("Brightness", 0.5, 1.5, 1.0, 0.05)
-                contrast = st.slider("Contrast", 0.5, 2.0, 1.0, 0.05)
-                sharpness = st.slider("Sharpness", 0.0, 3.0, 1.0, 0.1)
-                saturation = st.slider("Saturation", 0.0, 2.0, 1.0, 0.05)
-                
-                # Color correction options
-                gamma = st.slider("Gamma Correction", 0.7, 1.5, 1.0, 0.05)
-                auto_wb = st.checkbox("Auto White Balance")
-                
-                # Presets for quick adjustments
-                st.subheader("Presets")
-                preset_cols = st.columns(4)
-                
-                with preset_cols[0]:
-                    if st.button("Natural"):
-                        brightness, contrast, sharpness, saturation = 1.0, 1.1, 1.2, 1.0
-                        gamma, auto_wb = 1.0, True
-                
-                with preset_cols[1]:
-                    if st.button("Bright"):
-                        brightness, contrast, sharpness, saturation = 1.2, 1.2, 1.3, 1.1
-                        gamma, auto_wb = 0.9, True
-                
-                with preset_cols[2]:
-                    if st.button("Clear"):
-                        brightness, contrast, sharpness, saturation = 1.1, 1.3, 1.5, 0.9
-                        gamma, auto_wb = 1.1, True
-                
-                with preset_cols[3]:
-                    if st.button("B&W"):
-                        brightness, contrast, sharpness, saturation = 1.0, 1.4, 1.2, 0.0
-                        gamma, auto_wb = 1.0, False
-                
-                # Apply enhancements button
-                if st.button("Apply Enhancements"):
-                    with st.spinner("Applying enhancements..."):
-                        # Apply enhancements to the original image
-                        enhanced = enhance_image(original_image, brightness, contrast, sharpness, saturation)
-                        enhanced = apply_color_correction(enhanced, gamma, auto_wb)
-                        
-                        st.session_state.enhanced_image = enhanced
-                        st.success("✅ Enhancements applied!")
-            
-            with tabs[3]:
-                st.subheader("Advanced Settings")
-                
-                # Print layout options
-                st.subheader("Print Layout")
-                layout_type = st.radio(
-                    "Select layout type",
-                    ["Single photo", "Multiple photos (print sheet)"],
-                    horizontal=True
-                )
-                
-                if layout_type == "Multiple photos (print sheet)":
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        rows = st.number_input("Number of rows", 1, 8, 4)
-                    with col2:
-                        cols = st.number_input("Number of columns", 1, 8, 4)
-                    
-                    st.markdown(f"<p class='help-text'>Will generate a sheet with {rows*cols} photos</p>", unsafe_allow_html=True)
-                    
-                    # Paper size
-                    paper_size = st.selectbox(
-                        "Paper size",
-                        ["A4", "US Letter", "4×6 inch"]
-                    )
-                
-                # Guidelines options
-                show_guidelines = st.checkbox("Show face position guidelines", value=True)
-                
-                # Reset all settings button
-                if st.button("Reset All Settings"):
-                    # Reset all session state
-                    for key in list(st.session_state.keys()):
-                        if key != 'original_image':
-                            del st.session_state[key]
-                    st.experimental_rerun()
-            
-            # Process button for final image
-            process_col1, process_col2 = st.columns([2, 1])
-            with process_col1:
-                if st.button("Generate Passport Photo", use_container_width=True):
-                    with st.spinner("Processing your photo..."):
-                        try:
-                            # Step 1: Use enhanced image if available, otherwise original
-                            if st.session_state.enhanced_image is not None:
-                                process_image = st.session_state.enhanced_image
-                            else:
-                                process_image = original_image
-                            
-                            # Step 2: Change background
-                            bg_changed = change_background(process_image, bg_color)
-                            
-                            # Step 3: Resize to passport format
-                            passport_img = resize_to_passport(bg_changed, width, height, dpi)
-                            
-                            # Step 4: Generate print sheet if multiple layout selected
-                            if layout_type == "Multiple photos (print sheet)":
-                                # Create a new image based on paper size
-                                if paper_size == "A4":
-                                    sheet_width, sheet_height = int(210 * dpi / 25.4), int(297 * dpi / 25.4)
-                                elif paper_size == "US Letter":
-                                    sheet_width, sheet_height = int(8.5 * dpi), int(11 * dpi)
-                                else:  # 4×6 inch
-                                    sheet_width, sheet_height = int(4 * dpi), int(6 * dpi)
-                                
-                                sheet = Image.new('RGB', (sheet_width, sheet_height), 'white')
-                                
-                                # Calculate spacing
-                                h_spacing = sheet_width // cols
-                                v_spacing = sheet_height // rows
-                                
-                                # Paste photos onto sheet
-                                for r in range(rows):
-                                    for c in range(cols):
-                                        x = c * h_spacing + (h_spacing - passport_img.width) // 2
-                                        y = r * v_spacing + (v_spacing - passport_img.height) // 2
-                                        sheet.paste(passport_img, (x, y))
-                                
-                                final_img = sheet
-                            else:
-                                final_img = passport_img
-                            
-                            # Store the result in session state
-                            st.session_state.final_image = final_img
-                            st.session_state.processed = True
-                            
-                        except Exception as e:
-                            st.error(f"Error processing image: {str(e)}")
-            
-            with process_col2:
-                # Quick preview
-                if st.button("Quick Preview", use_container_width=True):
-                    with st.spinner("Generating preview..."):
-                        if st.session_state.enhanced_image is not None:
-                            preview = st.session_state.enhanced_image
-                        else:
-                            preview = original_image
-                        
-                        # Show a simplified preview
-                        st.image(preview, width=150)
-    
-    # Display results area
-    if st.session_state.processed and 'final_image' in st.session_state:
-        st.markdown("---")
-        st.subheader("📸 Your Passport Photo")
-        
-        result_col1, result_col2 = st.columns([2, 1])
-        
-        with result_col1:
-            st.image(st.session_state.final_image, width=400)
-        
-        with result_col2:
-            # Download section
-            st.markdown("### Download Options")
-            
-            # Format selection
-            download_format = st.radio(
-                "Select format",
-                ["JPEG", "PNG", "PDF"],
-                horizontal=True
-            )
-            
-            # Quality selection for JPEG
-            if download_format == "JPEG":
-                quality = st.slider("Quality", 70, 100, 95, 5)
-            else:
-                quality = 95
-            
-            # Download button
-            buf = io.BytesIO()
-            
-            if download_format == "JPEG":
-                st.session_state.final_image.save(buf, format="JPEG", quality=quality)
-                file_extension = "jpg"
-                mime_type = "image/jpeg"
-            elif download_format == "PNG":
-                st.session_state.final_image.save(buf, format="PNG")
-                file_extension = "png"
-                mime_type = "image/png"
-            else:  # PDF
-                from reportlab.pdfgen import canvas
-                from reportlab.lib.pagesizes import letter
-                
-                # Convert PIL to PDF
-                img_width, img_height = st.session_state.final_image.size
-                pdf_w, pdf_h = letter
-                
-                p = canvas.Canvas(buf, pagesize=letter)
-                # Center the image on the page
-                x_centered = (pdf_w - img_width) / 2
-                y_centered = (pdf_h - img_height) / 2
-                
-                # Draw image on the PDF
-                img_path = "temp_img.jpg"
-                st.session_state.final_image.save(img_path)
-                p.drawImage(img_path, x_centered, y_centered, width=img_width, height=img_height)
-                p.save()
-                
-                file_extension = "pdf"
-                mime_type = "application/pdf"
-            
-            st.download_button(
-                label=f"Download as {download_format}",
-                data=buf.getvalue(),
-                file_name=f"passport_photo.{file_extension}",
-                mime=mime_type,
-                use_container_width=True
-            )
-            
-            # Additional info
-            st.markdown("""
-            ### Compliance Information
-            
-            This photo meets standard requirements for:
-            - Proper dimensions
-            - Even lighting
-            - Neutral expression
-            - Plain background
-            
-            Always check specific requirements for your country or visa application.
-            """)
+        st.markdown("### 🛠 Settings")
+        config = {
+            'page_range': st.text_input("Convert pages (e.g., 1-3,5)", "all"),
+            'image_quality': st.slider("Image Quality", 1, 100, 85),
+            'output_format': st.radio("Output Format", [".docx", ".txt"]),
+            'ocr': st.checkbox("Enable OCR (for scanned documents)"),
+            'batch': st.checkbox("Batch Processing")
+        }
 
-# Run the app
+    with col2:
+        st.markdown("### 📤 Upload PDF")
+        uploaded_files = st.file_uploader("Choose PDF files", type="pdf", 
+                                       accept_multiple_files=config['batch'])
+        
+        if uploaded_files:
+            for file in uploaded_files:
+                # Input Validation
+                file.seek(0)
+                mime = magic.from_buffer(file.read(1024), mime=True)
+                if mime != 'application/pdf':
+                    st.error(ERROR_CODES[4])
+                    continue
+                
+                # Virus Check
+                if not virus_scan(file):
+                    st.error(ERROR_CODES[3])
+                    continue
+
+                # Password Check
+                try:
+                    with fitz.open(stream=file.read(), filetype="pdf") as test_doc:
+                        pass
+                except:
+                    st.error(ERROR_CODES[1])
+                    continue
+
+                # Conversion Logic
+                if st.button(f"Convert {file.name}", type="primary"):
+                    progress = st.progress(0)
+                    try:
+                        docx_data, stats = convert_pdf_to_docx(file, config)
+                        st.session_state.conversion_history.append({
+                            'filename': file.name,
+                            'timestamp': time.time(),
+                            'stats': stats
+                        })
+
+                        # Download Logic
+                        st.balloons()
+                        filename = file.name.replace(".pdf", f"{config['output_format']}")
+                        b64 = base64.b64encode(docx_data).decode()
+                        components.html(f"""
+                            <script>
+                                window.open('data:application/octet-stream;base64,{b64}')
+                            </script>
+                        """)
+                        
+                    except Exception as e:
+                        st.error(str(e))
+                    finally:
+                        progress.empty()
+
 if __name__ == "__main__":
+    if not os.path.exists("config.json"):
+        with open("config.json", "w") as f:
+            json.dump({
+                "default_quality": 85,
+                "default_format": ".docx",
+                "max_file_size": 50  # MB
+            }, f)
+    
+    if st.session_state.get('first_visit', True):
+        show_tour()
+        st.session_state.first_visit = False
+    
     main()
